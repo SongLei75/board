@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.tgz
+
+# CMake scratch + local wolfSSH/wolfSSL install trees (dev-only build inputs; not shipped, not tracked).
+build/
+
+# prebuilds/ (addon, wolfSSH/wolfSSL libs, and the debug.key credential) IS tracked on purpose:
+# it is the shipped runtime payload, and the debug credential is distributed with the private package.
