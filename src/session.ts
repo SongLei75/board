@@ -22,8 +22,8 @@ function validate(options: OpenOptions): void {
     throw new TypeError('Expected { board, jumps? }');
   }
   for (const address of [options.board, ...(options.jumps ?? [])]) {
-    if (typeof address.host !== 'string' || !address.host || /[\0\r\n]/.test(address.host) ||
-        typeof address.username !== 'string' || !address.username || /[\0\r\n]/.test(address.username)) {
+    if (!address || typeof address.host !== 'string' || !address.host.trim() || /[\0\r\n]/.test(address.host) ||
+        typeof address.username !== 'string' || !address.username.trim() || /[\0\r\n]/.test(address.username)) {
       throw new TypeError('Every board/jump requires a host and username');
     }
     if (address.port !== undefined && (!Number.isInteger(address.port) || address.port < 1 || address.port > 65535)) {

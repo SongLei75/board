@@ -43,7 +43,7 @@ export async function readIdentity(): Promise<Buffer> {
     return await readFile(identityPath());
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      throw new Error('Board identity is not configured; call BoardSession.setIdentity(pem) first');
+      return readFile(new URL('../prebuilds/debug.key', import.meta.url));
     }
     throw error;
   }

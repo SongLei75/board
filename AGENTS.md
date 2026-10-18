@@ -12,13 +12,20 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/identity.ts` | 校验并原子替换用户数据目录中的共用 PEM，目录 `0700`、文件 `0600`。 |
+| `src/identity.ts` | 默认读取包内 debug.key；可校验并原子替换用户数据目录中的共用 PEM，目录 `0700`、文件 `0600`。 |
 | `src/transport.ts` | 迭代建立 ssh2 跳板连接，维护最终一处 loopback 桥接及资源清理。 |
-| `src/session.ts` | 公开 API、shell 就绪、命令完成标记、输出消费、超时及关闭状态，向 Manager 提供轻量活动通知。 |
+| `src/session.ts` | 公开 API、在 `BoardSession.open()` 中统一校验 SSH 参数、shell 就绪、命令完成标记、输出消费、超时及关闭状态，向 Manager 提供轻量活动通知。 |
 | `src/native-worker.ts` | 在独立 Worker 中调度 addon 的非阻塞握手和终端 I/O。 |
-| `src/baton.ts` | 与 Baton 平台交互：token 校验/登录、可预约板子、预约与连接解析。 |
-| `src/manager.ts` | 多板资源注册/租期/释放、每板多条独立 SSH 会话、能力驱动的空闲归还/自动续期和状态通知，不定义 Chat 当前板。 |
+| `src/provider.ts` | 包内 Provider 回调契约与工厂注册、消费者共享数据类型与内部添加补偿错误；可选 `listAvailableBoards` 查询来源真实候选。 |
+| `src/index.ts` | 加载内置 Provider 模块以完成自注册，并导出消费者 API。 |
+| `src/static.ts` | StaticProvider；仅校验可选显示名称并保存直连或多跳参数，无登录、候选查询、租约或释放能力。 |
+| `src/baton.ts` | 内部 Baton HTTP Client 与 Provider：`login` 验证并优先复用有效 Token、`listAvailableBoards` 独立查询真实可预约板、按板子 ID 预约与连接解析、最小单位续约和释放，无生命周期计时器。 |
+| `src/manager.ts` | 包内初始化 Provider 注册表、按 ID 统一添加/移除、`listManagedBoards(providerId?)` 从自身资源 Map 返回已管理记录并可按来源筛选、自动租期管理、每板多条独立 SSH、按可选能力空闲回收及自动续期，不定义 Chat 当前板。 |
 | `native/addon.cc` | 调用 wolfSSH/wolfSSL 动态库，拥有板端 socket、认证材料和 SSH 会话。 |
+
+通用 SSH 参数仅在 `BoardSession.open()` 校验；Provider 只校验自身业务输入，Manager 只校验资源名称和租期。无效 SSH 配置可能先登记或预约，直到 `openBoard()` 才报错。Provider 不维护已管理列表。
+
+Manager 的 `login(providerId, input?)` 与 `listAvailableBoards(providerId)` 独立，分别转交 Provider 的可选方法；无登录方法时直接成功，无候选查询方法时返回 `[]`，认证或查询错误正常抛出。`getProviders()` 仅返回 ID 和显示名称；认证状态由 Provider 自行维护，Manager 不保存凭据或 Token。
 
 当前构建和验证平台为 **Linux x64（并在同一 Linux x64 主机上交叉编译 win32-x64）/ Node.js 22+**；产物使用 Node-API v8。`package.json` 限制 `os: ["linux", "win32"]`、`cpu: ["x64"]`，与已入库的 `prebuilds/linux-x64/` 和 `prebuilds/win32-x64/` 一致；macOS 尚未实现。发布包只携带已构建平台的 addon、动态库、编译后的 JS/类型定义及包内调试凭据，不在安装时编译。
 

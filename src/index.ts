@@ -1,8 +1,11 @@
+// Loading a provider module registers its factory before consumers create a manager.
+import './static.js';
+import './baton.js';
+
 export { BoardSession } from './session.js';
 export type { BoardAddress, JumpAddress, OpenOptions, ExecResult, TerminalOutput } from './types.js';
-export { getConnectionModes } from './modes.js';
-export type { ConnectionMode } from './modes.js';
-export { BatonClient, BatonApiError } from './baton.js';
-export type { BatonBoard, BatonReservation, BatonClientOptions } from './baton.js';
+export type { ProviderInfo, BoardLease, AvailableBoard } from './provider.js';
 export { BoardManager } from './manager.js';
-export type { ManagedBoard, BoardLifecycle, BoardSnapshot, BoardManagerOptions, BoardEvent } from './manager.js';
+export type { ManagedBoard, BoardState, BoardManagerOptions, BoardEvent } from './manager.js';
+export type { StaticBoardInput } from './static.js';
+export type { BatonCredentials, BatonBoardInput } from './baton.js';

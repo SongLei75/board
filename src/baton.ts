@@ -7,22 +7,21 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { OpenOptions } from './types.js';
+import { BoardAddError, registerProvider, type AvailableBoard, type BoardProvider, type ProviderBoard } from './provider.js';
 
-export interface BatonBoard {
+const minimumMinutes = 60;
+
+interface BatonBoard {
 	b_id: string;
 	device_code: string;
 	type: number;
-	type_name?: string;
-	project_code?: string;
-	vehicle_model?: string;
-	hardware_platform?: string;
 	server: { b_id: string; ip_addr: string };
 	sub_boards?: { b_id: string; ip_addr: string }[];
 	default_reservation_docker_image?: string;
 	reservations?: BatonReservation[];
 }
 
-export interface BatonReservation {
+interface BatonReservation {
 	b_id: string;
 	board_b_id: string;
 	start_at: string;
@@ -30,12 +29,6 @@ export interface BatonReservation {
 	/** True once the reservation was released before its scheduled end. */
 	early_released?: boolean;
 	board?: BatonBoard;
-}
-
-export interface BatonClientOptions {
-	apiUrl?: string;
-	authUrl?: string;
-	token?: string;
 }
 
 interface PortMapping { name: string; port: number }
@@ -51,33 +44,26 @@ function formatApiDate(date: Date): string {
 }
 
 /** HTTP or application error. Failed queries are never represented as empty lists. */
-export class BatonApiError extends Error {
+class BatonApiError extends Error {
 	constructor(message: string, readonly code: number) {
 		super(message);
 		this.name = 'BatonApiError';
 	}
 }
 
-/** UI-independent BenchOps client. The host owns credential persistence and reservation lifetime. */
-export class BatonClient {
+/** Internal BenchOps HTTP client. Credentials live only in this provider instance. */
+class BatonClient {
 	readonly apiUrl: string;
 	readonly authUrl: string;
 	private token?: string;
 
-	constructor(options: BatonClientOptions = {}) {
+	constructor() {
 		let config: { boardops_api_url?: string; baton_auth_url?: string } = {};
 		try {
 			config = JSON.parse(readFileSync(join(homedir(), '.benchops', 'config.json'), 'utf8'));
 		} catch { /* Optional local configuration. */ }
-		this.apiUrl = (options.apiUrl || process.env.BENCHOPS_API_URL || config.boardops_api_url || 'https://board.carizon.work').replace(/\/$/, '');
-		this.authUrl = (options.authUrl || process.env.BATON_AUTH_URL || config.baton_auth_url || 'https://auth.carizon.work').replace(/\/$/, '');
-		this.token = options.token;
-	}
-
-	setToken(token: string | undefined): void { this.token = token; }
-
-	listDurations(): readonly { label: string; minutes: number }[] {
-		return [1, 2, 4, 8, 24].map(hours => ({ label: `${hours} h`, minutes: hours * 60 }));
+		this.apiUrl = (process.env.BENCHOPS_API_URL || config.boardops_api_url || 'https://board.carizon.work').replace(/\/$/, '');
+		this.authUrl = (process.env.BATON_AUTH_URL || config.baton_auth_url || 'https://auth.carizon.work').replace(/\/$/, '');
 	}
 
 	private async request<T>(path: string, method = 'GET', body?: object, auth = false): Promise<T | undefined> {
@@ -104,28 +90,26 @@ export class BatonClient {
 		return result.data;
 	}
 
-	async validateToken(token = this.token): Promise<boolean> {
-		if (!token) { return false; }
-		this.setToken(token);
+	async validateToken(): Promise<boolean> {
+		if (!this.token) { return false; }
 		try {
 			await this.getBoardTypes();
 			return true;
 		} catch (error) {
 			if (error instanceof BatonApiError && (error.code === 401 || error.code === 403)) {
-				this.setToken(undefined);
+				this.token = undefined;
 				return false;
 			}
 			throw error;
 		}
 	}
 
-	async login(username: string, password: string): Promise<string> {
+	async login(username: string, password: string): Promise<void> {
 		const data = await this.request<{ jwt_token?: string; token?: string }>(
 			'/api/system/sso/login', 'POST', { username, password }, true);
 		const token = data?.jwt_token || data?.token;
 		if (!token) { throw new Error('Baton login returned no token'); }
-		this.setToken(token);
-		return token;
+		this.token = token;
 	}
 
 	async listAvailableBoards(): Promise<BatonBoard[]> {
@@ -147,14 +131,7 @@ export class BatonClient {
 		return Array.isArray(data) ? data : data?.items ?? [];
 	}
 
-	private validateDuration(minutes: number): void {
-		if (!this.listDurations().some(duration => duration.minutes === minutes)) {
-			throw new RangeError('Select a supported Baton reservation duration');
-		}
-	}
-
-	async reserve(board: BatonBoard, minutes: number): Promise<BatonReservation> {
-		this.validateDuration(minutes);
+	async reserve(board: BatonBoard): Promise<BatonReservation> {
 		const start = new Date();
 		const body: {
 			board_b_id: string; start_at: string; end_at: string; server_reserved: boolean;
@@ -162,7 +139,7 @@ export class BatonClient {
 			container_port_mappings?: { name: string; container_port: string; host_port: string; protocol: string }[];
 		} = {
 			board_b_id: board.b_id, start_at: formatApiDate(start),
-			end_at: formatApiDate(new Date(start.getTime() + minutes * 60_000)), server_reserved: false,
+			end_at: formatApiDate(new Date(start.getTime() + minimumMinutes * 60_000)), server_reserved: false,
 		};
 		if (board.default_reservation_docker_image) { body.docker_image = board.default_reservation_docker_image; }
 		const types = await this.getBoardTypes();
@@ -180,10 +157,9 @@ export class BatonClient {
 	}
 
 	/** Extend an existing reservation and return its new absolute expiration. */
-	async renew(reservationId: string, minutes: number): Promise<number> {
-		this.validateDuration(minutes);
+	async renew(reservationId: string): Promise<number> {
 		const end = await this.request<string | { end_at?: string } | undefined>(
-			`/api/boardops/v1/reservation/${encodeURIComponent(reservationId)}/extend`, 'PATCH', { extension_minutes: minutes });
+			`/api/boardops/v1/reservation/${encodeURIComponent(reservationId)}/extend`, 'PATCH', { extension_minutes: minimumMinutes });
 		const raw = typeof end === 'string' ? end : end?.end_at;
 		const expiresAt = raw ? Date.parse(raw) : NaN;
 		if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) { throw new Error('Baton returned an invalid reservation end time'); }
@@ -212,3 +188,108 @@ export class BatonClient {
 	}
 
 }
+
+export interface BatonCredentials {
+	username: string;
+	password: string;
+}
+
+export interface BatonBoardInput {
+	boardId: string;
+}
+
+interface BatonHandle {
+	reservationId: string;
+	expiresAt: number;
+	renewalUncertain?: boolean;
+}
+
+/** Adapts Baton operations; only BoardManager decides when to renew or release. */
+class BatonProvider implements BoardProvider<BatonBoardInput, BatonHandle, BatonCredentials> {
+	readonly id = 'baton';
+	readonly displayName = 'Baton';
+	private readonly client = new BatonClient();
+	private authenticating?: Promise<void>;
+
+	private readonly candidates = new Map<string, BatonBoard>();
+
+	private async authenticate(input?: BatonCredentials): Promise<void> {
+		if (!await this.client.validateToken()) {
+			this.candidates.clear();
+			if (!input || typeof input.username !== 'string' || !input.username.trim() ||
+				typeof input.password !== 'string' || !input.password) {
+				throw new TypeError('Baton authentication requires a username and password');
+			}
+			await this.client.login(input.username, input.password);
+		}
+	}
+
+	async login(input?: BatonCredentials): Promise<void> {
+		// Concurrent login calls share one authentication.
+		const authentication = this.authenticating ??= this.authenticate(input);
+		try {
+			await authentication;
+		} finally {
+			if (this.authenticating === authentication) this.authenticating = undefined;
+		}
+	}
+
+	async listAvailableBoards(): Promise<AvailableBoard[]> {
+		const boards = await this.client.listAvailableBoards();
+		this.candidates.clear();
+		for (const board of boards) this.candidates.set(board.b_id, board);
+		return boards.map(board => ({ id: board.b_id, name: board.device_code }));
+	}
+
+	getBoardKey(input: BatonBoardInput): string {
+		if (!input || typeof input.boardId !== 'string' || !input.boardId.trim()) {
+			throw new TypeError('Select a valid Baton board ID');
+		}
+		return `${this.client.apiUrl}:${input.boardId}`;
+	}
+
+	async addBoard(input: BatonBoardInput): Promise<ProviderBoard<BatonHandle>> {
+		this.getBoardKey(input);
+		const board = this.candidates.get(input.boardId);
+		if (!board || typeof board.device_code !== 'string' || !board.device_code.trim() || !Number.isInteger(board.type)) {
+			throw new Error('Select a board from the latest Baton available-board list');
+		}
+		const reservation = await this.client.reserve(board);
+		const handle: BatonHandle = { reservationId: reservation.b_id, expiresAt: Date.parse(reservation.end_at) };
+		try {
+			const connection = await this.client.resolveConnection(reservation, board);
+			if (!Number.isFinite(handle.expiresAt) || handle.expiresAt <= Date.now()) {
+				throw new Error('Baton returned an invalid reservation expiration');
+			}
+			return { name: board.device_code, connection, lease: { expiresAt: handle.expiresAt }, handle };
+		} catch (error) {
+			try { await this.releaseBoard(handle); }
+			catch (releaseError) {
+				throw new BoardAddError(handle, [error, releaseError], `Could not resolve or release Baton reservation ${reservation.b_id}`);
+			}
+			throw error;
+		}
+	}
+
+	async renewBoard(handle: BatonHandle): Promise<number> {
+		// A timeout cannot prove the platform did not extend the reservation.
+		handle.renewalUncertain = true;
+		const expiresAt = await this.client.renew(handle.reservationId);
+		if (!Number.isFinite(expiresAt) || expiresAt <= Math.max(Date.now(), handle.expiresAt)) {
+			throw new Error('Baton returned a renewal expiration that does not extend the reservation');
+		}
+		handle.expiresAt = expiresAt;
+		handle.renewalUncertain = false;
+		return expiresAt;
+	}
+
+	async releaseBoard(handle: BatonHandle): Promise<void> {
+		// Skip only confirmed natural expiration, never an uncertain renewal result.
+		if (!handle.renewalUncertain && handle.expiresAt <= Date.now()) return;
+		await this.client.release(handle.reservationId);
+		handle.expiresAt = 0;
+		handle.renewalUncertain = false;
+	}
+}
+
+registerProvider(() => new BatonProvider());
