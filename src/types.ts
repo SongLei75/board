@@ -5,7 +5,6 @@ export interface BoardAddress {
 }
 
 export interface JumpAddress extends BoardAddress {
-  privateKeyFile?: string;
   password?: string;
 }
 

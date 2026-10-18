@@ -13,8 +13,8 @@
 1 跳：Node.js ─ SSH(A) ────────────────────── Board:22
 N 跳：Node.js ─ SSH(A) ─ SSH(B) ─ … ─ SSH(N) ─ Board:22
                                                  │
-                                   同一份本地 wolfSSH 客户端
-                                   完成最终板端 SSH/X.509 会话
+                              每条 SSH 均由独立的本地 Worker
+                              调用同一个 wolfSSH native addon
 ```
 
 - `jumps: []` 就是直连；1～N 跳重复同一转发算法，不设计按跳数区分的接口或类。
@@ -55,13 +55,13 @@ const session = await BoardSession.open({
       host: 'jump-a.example',
       port: 22,
       username: 'alice',
-      privateKeyFile: '/path/jump-a-key',
+      password: jumpAPassword,
     },
     {
       host: '10.10.0.2',
       port: 22,
       username: 'bob',
-      privateKeyFile: '/path/jump-b-key',
+      password: jumpBPassword,
     },
   ],
 });
@@ -77,7 +77,7 @@ try {
 
 `jumps` 省略时默认为 `[]`；端口省略时默认为 `22`。数组按真实连接顺序填写。板端用户名和地址属于单次连接参数，复合 PEM 不属于单次连接参数。
 
-每一跳使用其独立的 SSH 认证（privateKeyFile 或 password），与板端的复合 PEM 互不混用。Baton 的跳板参数由其 Provider 解析，Static 使用消费者提供的认证参数。不要求调用方提供转发端口、SSH 命令或内部 socket。
+每一跳使用独立的 `password`，与板端的复合 PEM 互不混用。本轮不支持普通 SSH 公钥/私钥认证，`privateKeyFile` 已从公开类型移除；旧配置在 `BoardSession.open()` 时明确报错，即使同时提供密码也不会静默忽略私钥配置。Baton 的跳板参数由其 Provider 解析，Static 使用消费者提供的认证参数。不要求调用方提供转发端口、SSH 命令或内部 socket。
 
 ### 会话方法
 
@@ -95,64 +95,52 @@ try {
 
 ## 3. 0～N 跳如何实现
 
-npm 使用 `ssh2` 建立跳板链。SSH `direct-tcpip` 传的是**到下一目标的原始 TCP 数据**，中间无需启动 wolfssh。
+所有 SSH 连接统一使用 wolfSSH/wolfSSL。Transport 按 `jumps` 顺序启动独立的 `native-worker.ts` 实例，每个 Worker 只持有自身创建的一个原生 SSH 会话。
 
 ```text
-首跳：Node.js ─ TCP ─ SSH(A)
-
-下一跳：SSH(A).forwardOut(B:22) ─ Duplex ─ SSH(B).connect({ sock })
-
-继续：SSH(B).forwardOut(C:22) ─ Duplex ─ SSH(C).connect({ sock })
-
-最终：SSH(N).forwardOut(Board:22) ─ Duplex ─ 板端 TCP 字节流
+Worker A：Password + Shell → direct-tcpip(Jump B:22)
+                                 ↕ 二进制消息 + TCP 桥接
+                           127.0.0.1:随机端口 P1
+                                 ↕
+Worker B：Password + Shell → direct-tcpip(Board:22)
+                                 ↕ 二进制消息 + TCP 桥接
+                           127.0.0.1:随机端口 P2
+                                 ↕
+Worker C：X.509 + Terminal → 板端持久 Shell
 ```
 
-内部只需要一段按 `jumps` 顺序迭代的逻辑。0 跳直接访问板端，不创建 ssh2 跳板连接。每个后续节点的地址由**上一跳可访问的网络**决定。
+- 0 跳直接访问板端；1～N 跳重复同一个循环。每个后续目标的地址由上一跳可访问的网络决定。
+- 跳板密码认证成功后保留 wolfSSH 自动创建的普通 Shell，不申请 PTY，不在其中执行转发命令。该 Shell 关闭不会被当作整个 SSH 连接关闭。
+- 转发使用 `wolfSSH_ChannelFwdNewLocal()` 创建 `direct-tcpip` 通道，收到远端开通确认后才返回可用桥接端口。
+- 跳板必须允许密码登录、Shell 和 TCP forwarding；不允许转发时直接报错。无需在跳板安装 wolfSSH 或其他转发工具。
+- 保留 30 秒连接/转发超时，以及 20 秒冷启动重试窗口、750 毫秒重试间隔。仅连接拒绝/重置可重试，认证失败和远端拒绝转发直接抛出。
 
-跳板必须允许 SSH TCP forwarding；如果不允许，建链失败，不回退成在跳板上执行 netcat、socat 或其他命令。
+## 4. 每跳本地 TCP 桥接
 
-## 4. wolfSSH 如何接收最终 TCP 连接
+原生 wolfSSH 接收操作系统 socket，Worker 与主线程之间传递二进制消息。因此每跳使用一处本地 TCP 桥接，将该跳的 Forward Channel 接到下一条 SSH 连接。
 
-`ssh2.forwardOut()` 得到的是 JS Duplex stream，而本地 wolfSSH 动态库接收操作系统 socket；两者不能直接强制转换。
-
-**第一版只在最终接入 wolfSSH 时处理这一次接口差异：**
-
-- **0 跳**：原生模块直接建立到 `board.host:port` 的 TCP socket，然后创建 wolfSSH 会话。
-- **1～N 跳**：npm 在 `127.0.0.1:0` 创建一个内部临时监听端口；原生模块连接该端口，npm 将接收到的 loopback socket 与最后一个 `forwardOut(board.host, board.port)` stream 双向连接。
-
-```text
-ssh2(A) -> … -> ssh2(N) -> forwardOut(Board:22)
-                                  ||
-                           内部双向 TCP 桥接
-                                  ||
-                        127.0.0.1:临时端口
-                                  |
-                         wolfSSH 原生 socket
-                                  |
-                         板端 X.509 SSH Session
-```
-
-- **不是每跳一个本地端口**；整个会话最多只有最终接入原生模块所需的这一个内部临时监听。
-- 桥接后不再需要监听器，但已建立的 socket/forwardOut stream 必须保持到会话结束。
-- 内部端口不固定、不暴露给调用方，也不对外网卡监听。
-- 桥接只转发原始 TCP 数据，不代替 wolfSSH 做 SSH 握手、认证或终端处理。
-- 只实现必要的双向转发、断开处理与清理；暂不引入自定义 wolfSSH I/O callback 来替换这条简单路径。
+- 只监听 `127.0.0.1:0`；接入一个 socket 后立即关闭监听器，已接入 socket 保留到会话结束。
+- TCP 输入暂停到 Worker 完成对应写入；Worker 输出等 socket 写回调确认后再继续读取，限制消息及 socket 队列。
+- addon 保留一处最多 256 KiB 的加密发送缓冲，处理部分 socket 写入。缓冲未排空时暂停应用通道读写，避免现有库在窗口更新/打开通道遇到 `WS_WANT_WRITE` 时丢失已消费数据或通道状态。
+- 转发按字节处理，不做 UTF-8 解码；终端文本仍由 Session 处理。
+- 关闭时从最后一跳向前释放 Worker、监听器和已接入 socket；失败尝试的迟到事件不会影响下一次尝试。
+- 每条 BoardSession 有独立跳板链，不复用连接。
 
 ## 5. wolfSSH 能力依赖与模块边界
 
-BoardSession **消费** wolfSSH/wolfSSL 提供的客户端动态库能力：接入 TCP socket、使用复合 PEM 进行 X.509 SSH 认证、建立持久终端会话、收发 SSH 通道数据以及关闭会话。
-
 ```text
-@carizon/board-session
-  JS/TS                  0～N 跳建链、必要的 TCP 桥接、统一会话 API
-  native (Node-API)      调用 wolfSSH 动态库，处理板端会话和终端 I/O
-  wolfSSH / wolfSSL      最终板子的 SSH/X.509 协议能力
+BoardSession            公开终端 API、命令边界、输出与关闭状态
+Transport               0～N 跳编排、逐跳 loopback 桥接、超时、重试、清理
+native-worker.ts        通用连接配置、通道消息、非阻塞调度与背压
+native addon            socket、Password/X.509 认证、Shell/Forward 通道与 I/O
+wolfSSH / wolfSSL       SSH 协议与密码学
 ```
 
-- wolfSSH 不负责逐跳建链或调用方的连接参数。
-- ssh2 只用于跳板 SSH 和 TCP forwarding，不参与最终板端 X.509 SSH 认证。
-- BoardSession 以 native addon 调用库接口，不启动 `wolfssh` 可执行文件，也不要求任何跳板安装 wolfSSH。
-- npm 交付物携带与运行平台匹配的 addon 及所需动态库，不依赖全局安装或手工设置库搜索路径。
+- Addon 和 Worker 不区分板子或跳板；两种认证都属于通用原生能力。公开 BoardSession 使用 X.509 + Terminal 连接板端，使用 Password + 普通 Shell 连接跳板。
+- 原生连接、认证、握手和通道操作复用一套实现，仅有 `src/native-worker.ts` 一种 Worker 脚本。
+- Manager、Provider、Baton 和 Static 的业务职责不变，Provider 不管理 SSH 生命周期。
+- npm 交付物携带 addon 及现有 wolfSSH/wolfSSL 动态库；安装时不编译，不需要全局库或 `LD_LIBRARY_PATH`。
+- 修改 addon 后必须 `make build` 同时刷新 Linux x64 和 Windows x64 的 `board_session.node`。构建只消费 `build/deps/<platform>/` 的匹配头文件、库和 Windows 导入库，不重新构建 wolfSSH/wolfSSL。
 - 一份复合 PEM 由 npm 配置和保存，供所有板端会话使用。
 
 ## 6. 会话行为约束
@@ -259,7 +247,7 @@ await manager.removeBoard(batonBoard.id); // 关闭所有 SSH，然后释放预�
 
 `provider.ts` 定义内部契约和工厂注册表：必需 `id/displayName/addBoard`，可选 `login/listAvailableBoards/getBoardKey/renewBoard/releaseBoard`。每个 Provider 独立实现业务并自注册；`index.ts` 导入内置模块；Manager 不引用具体 Provider，也不按来源 ID 分支。不同 Manager 的 Provider 实例、认证及资源状态独立。
 
-Static 只处理 `{ name?, board, jumps? }`：仅校验可选显示名称，保存目标地址和可选的多级跳板。它没有 `login/listAvailableBoards/renewBoard/releaseBoard`，没有虚拟候选板，不预约、不自动回收 SSH。端口默认 22，跳板为 0～N 个，每跳提供 `password` 或 `privateKeyFile`。
+Static 只处理 `{ name?, board, jumps? }`：仅校验可选显示名称，保存目标地址和可选的多级跳板。它没有 `login/listAvailableBoards/renewBoard/releaseBoard`，没有虚拟候选板，不预约、不自动回收 SSH。端口默认 22，跳板为 0～N 个，每跳提供 `password`，不支持 `privateKeyFile`。
 
 Baton 的 `login({ username, password })` 优先通过 `validateToken()` 验证已有 Token；有效时即使传入凭据也直接复用，不切换账号。无有效 Token 时清理候选缓存，有凭据则登录，无凭据则抛出认证错误；验证期间的网络或平台异常直接抛出。并发登录共享同一次认证，Token 仅保存在所属 Provider 内存中，Manager 不保存凭据或登录状态。登录与列板互不调用，消费者可单独调用 `manager.login('baton')` 验证并复用有效认证。
 
@@ -297,4 +285,4 @@ Manager 不维护唯一“当前板”，不保存 Chat/Agent ID。同板 Sessio
 
 `onDidChange()` 通知 `added/renewed/renewFailed/released/releaseFailed/expired`，事件包含板子基本信息、类型与可选错误。监听器异常不影响清理。每板最多一个 `unref()` 定时器，不阻止 Node 退出；仅管理当前进程和 Manager 实例，不引入跨进程恢复、连接池或自动重连。
 
-本轮保留 ssh2 跳板和 wolfSSH 板端链路；wolfSSH 全链路转发及 SCP/SFTP 尚未实现。
+全链路 SSH 和转发均使用 wolfSSH；普通 SSH 私钥认证、SCP/SFTP 尚未实现。

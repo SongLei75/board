@@ -31,11 +31,11 @@ function validate(options: OpenOptions): void {
     }
   }
   for (const jump of options.jumps ?? []) {
-    if (jump.privateKeyFile !== undefined && (typeof jump.privateKeyFile !== 'string' || !jump.privateKeyFile)) {
-      throw new TypeError('Jump privateKeyFile must be a non-empty string');
+    if ('privateKeyFile' in jump) {
+      throw new TypeError('Jump privateKeyFile is not supported; use password authentication');
     }
-    if (!jump.privateKeyFile && (typeof jump.password !== 'string' || !jump.password)) {
-      throw new TypeError('Each jump requires a password or privateKeyFile');
+    if (typeof jump.password !== 'string' || !jump.password) {
+      throw new TypeError('Each jump requires a password');
     }
   }
 }
@@ -84,9 +84,9 @@ export class BoardSession {
       const timeout = setTimeout(() => this.fail(new Error('Board SSH connection timed out')), 30_000);
       this.openingReject = error => { clearTimeout(timeout); reject(error); };
       const worker = this.worker = new Worker(new URL('./native-worker.js', import.meta.url), {
-        workerData: { ...endpoint, username, pem },
+        workerData: { ...endpoint, username, auth: { type: 'x509', identity: pem }, terminal: true },
         // The VS Code extension host can carry Electron/V8 flags rejected by Node workers.
-      execArgv: [],
+        execArgv: [],
       });
       worker.on('message', message => {
         if (message.type === 'ready') {
@@ -95,9 +95,12 @@ export class BoardSession {
           resolve();
         } else if (message.type === 'data') {
           this.accept(this.decoder.write(Buffer.from(message.data)));
+          worker.postMessage({ type: 'consumed' });
         } else if (message.type === 'written') {
           this.writes.get(message.id)?.resolve();
           this.writes.delete(message.id);
+        } else if (message.type === 'channelClosed') {
+          this.fail(new Error('Board SSH channel closed'));
         } else if (message.type === 'failure') {
           this.fail(new Error(message.message));
         }

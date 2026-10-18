@@ -13,17 +13,19 @@
 | 文件 | 职责 |
 | --- | --- |
 | `src/identity.ts` | 默认读取包内 debug.key；可校验并原子替换用户数据目录中的共用 PEM，目录 `0700`、文件 `0600`。 |
-| `src/transport.ts` | 迭代建立 ssh2 跳板连接，维护最终一处 loopback 桥接及资源清理。 |
+| `src/transport.ts` | 通过通用 Worker 迭代建立密码跳板连接，维护每跳 loopback 桥接、背压、重试及反向资源清理。 |
 | `src/session.ts` | 公开 API、在 `BoardSession.open()` 中统一校验 SSH 参数、shell 就绪、命令完成标记、输出消费、超时及关闭状态，向 Manager 提供轻量活动通知。 |
-| `src/native-worker.ts` | 在独立 Worker 中调度 addon 的非阻塞握手和终端 I/O。 |
+| `src/native-worker.ts` | 唯一的通用 Worker 脚本；每实例调度独立 addon 连接的握手、Shell/Forward 通道 I/O 和消费确认，不区分板端或跳板。 |
 | `src/provider.ts` | 包内 Provider 回调契约与工厂注册、消费者共享数据类型与内部添加补偿错误；可选 `listAvailableBoards` 查询来源真实候选。 |
 | `src/index.ts` | 加载内置 Provider 模块以完成自注册，并导出消费者 API。 |
 | `src/static.ts` | StaticProvider；仅校验可选显示名称并保存直连或多跳参数，无登录、候选查询、租约或释放能力。 |
 | `src/baton.ts` | 内部 Baton HTTP Client 与 Provider：`login` 验证并优先复用有效 Token、`listAvailableBoards` 独立查询真实可预约板、按板子 ID 预约与连接解析、最小单位续约和释放，无生命周期计时器。 |
 | `src/manager.ts` | 包内初始化 Provider 注册表、按 ID 统一添加/移除、`listManagedBoards(providerId?)` 从自身资源 Map 返回已管理记录并可按来源筛选、自动租期管理、每板多条独立 SSH、按可选能力空闲回收及自动续期，不定义 Chat 当前板。 |
-| `native/addon.cc` | 调用 wolfSSH/wolfSSL 动态库，拥有板端 socket、认证材料和 SSH 会话。 |
+| `native/addon.cc` | 调用 wolfSSH/wolfSSL 动态库，拥有通用 socket、Password/X.509 认证材料、Shell/Forward 通道及有上限的加密发送缓冲。 |
 
 通用 SSH 参数仅在 `BoardSession.open()` 校验；Provider 只校验自身业务输入，Manager 只校验资源名称和租期。无效 SSH 配置可能先登记或预约，直到 `openBoard()` 才报错。Provider 不维护已管理列表。
+
+跳板仅支持 `password`；`privateKeyFile` 已移除，旧配置在 `BoardSession.open()` 明确报错。板端继续使用共享 X.509 复合 PEM 和 PTY；跳板保留自动 Shell，不申请 PTY。仅收到远端 `direct-tcpip` 开通确认后才建立可用桥接。Addon 继续无条件接受服务器公钥，不提供服务端身份验证；存在中间人攻击及密码泄露风险，本轮按已确认方案保留。
 
 Manager 的 `login(providerId, input?)` 与 `listAvailableBoards(providerId)` 独立，分别转交 Provider 的可选方法；无登录方法时直接成功，无候选查询方法时返回 `[]`，认证或查询错误正常抛出。`getProviders()` 仅返回 ID 和显示名称；认证状态由 Provider 自行维护，Manager 不保存凭据或 Token。
 
@@ -73,7 +75,7 @@ try {
 "
 ```
 
-建议覆盖：持久 shell（变量与工作目录保留）、退出码、超时后 `completed: false` 与恢复、交互输入、Ctrl-C 后的未确定状态、大输出/大输入、凭据替换、认证失败与建链失败后的清理。多跳时按真实连接顺序填写 `jumps`。多板功能重点实测并行打开不同板及同板多个独立 SSH；关闭单一 session 不释放板子；移除板子关闭其所有 session；在途连接与释放竞态；release 失败可重试。
+建议覆盖：持久 shell（变量与工作目录保留）、退出码、超时后 `completed: false` 与恢复、交互输入、Ctrl-C 后的未确定状态、大输出/大输入、凭据替换、认证失败与建链失败后的清理。多跳时按真实连接顺序填写 `jumps`，每跳提供密码。全链路验收覆盖 0/1/N 跳、远端拒绝转发、跳板 Shell 退出后继续转发、二进制大流量与慢接收背压、重协商、冷启动重试、断链、在途关闭、重复关闭及 Worker/socket 清理。多板功能重点实测并行打开不同板及同板多个独立 SSH；关闭单一 session 不释放板子；移除板子关闭其所有 session；在途连接与释放竞态；release 失败可重试。
 
 ## 发布到私有源
 

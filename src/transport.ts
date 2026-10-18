@@ -1,11 +1,9 @@
-import { readFile } from 'node:fs/promises';
 import { createServer, type Server, type Socket } from 'node:net';
-import { Client, type ClientChannel, type ConnectConfig } from 'ssh2';
+import { Worker } from 'node:worker_threads';
 import type { OpenOptions } from './types.js';
 
 const CONNECT_TIMEOUT = 30_000;
-// A Baton reservation's forwarded jump port is not instantly connectable (cold
-// start ~1s, variable). Probe it for a bounded window before giving up.
+// A Baton reservation's forwarded jump port is not instantly connectable.
 const CONNECT_WARMUP_MS = 20_000;
 const CONNECT_RETRY_MS = 750;
 
@@ -13,33 +11,32 @@ function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-/**
- * True for a connect refusal that can resolve on its own while a forwarded port
- * warms up. Deliberately narrow: a real timeout or unreachable host is a config
- * error, not a warmup symptom, and must surface instead of being retried.
- */
 function isTransientConnectError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /ECONNREFUSED|Connection refused|ECONNRESET|Connection reset/i.test(message);
 }
 
-/**
- * Resources of a single open() attempt. Its identity is checked on every ssh2
- * event: once an attempt is superseded (retry) or discarded (close), its late
- * events are ignored instead of affecting the transport.
- */
-interface Attempt {
-  readonly channels: ClientChannel[];
-  readonly clients: Client[];
-  readonly closures: Promise<void>[];
+interface Peer {
+  worker: Worker;
+  stopped: Promise<void>;
   server?: Server;
   socket?: Socket;
-  /** Set once this attempt produced the returned endpoint; failures past it are terminal. */
+  channel?: number;
+  buffered?: Buffer;
+  ready?: () => void;
+  forwarded?: () => void;
+  writeId: number;
+}
+
+// Events belong to one attempt; late messages cannot affect a retry or close().
+interface Attempt {
+  readonly peers: Peer[];
   live: boolean;
+  error?: Error;
   teardown?: Promise<void>;
 }
 
-// Owns only jump SSH connections and the single final loopback bridge.
+// Owns jump connections and one loopback TCP bridge per forwarding channel.
 export class Transport {
   private closed = false;
   private failure?: Error;
@@ -50,14 +47,9 @@ export class Transport {
   constructor(private readonly onFailure: (error: Error) => void) {}
 
   private fail(error: Error, attempt: Attempt): void {
-    if (this.closed || this.failure) return;
-    // Only the attempt that is still current may affect the transport. Events from
-    // a superseded attempt (retry) or from any attempt after close() are ignored.
-    if (attempt !== this.attempt) return;
-    // Reject the in-flight wait so open() can retry while the port warms up.
+    if (this.closed || this.failure || attempt !== this.attempt || attempt.error) return;
+    attempt.error = error;
     for (const reject of this.pending) reject(error);
-    // A failure after a successful connect is terminal; during open it only fails
-    // the current attempt.
     if (!attempt.live) return;
     this.failure = error;
     this.onFailure(error);
@@ -66,7 +58,8 @@ export class Transport {
 
   private wait<T>(start: (resolve: (value: T) => void, reject: (error: Error) => void) => void): Promise<T> {
     return new Promise((resolve, reject) => {
-      if (this.closed || this.failure) return reject(this.failure ?? new Error('Transport is closed'));
+      if (this.closed || this.failure || this.attempt?.error)
+        return reject(this.failure ?? this.attempt?.error ?? new Error('Transport is closed'));
       const fail = (error: Error) => { cleanup(); reject(error); };
       const timer = setTimeout(() => fail(new Error('SSH forwarding timed out')), CONNECT_TIMEOUT);
       const cleanup = () => { clearTimeout(timer); this.pending.delete(fail); };
@@ -76,34 +69,18 @@ export class Transport {
     });
   }
 
-  private async forward(attempt: Attempt, client: Client, host: string, port: number): Promise<ClientChannel> {
-    return this.wait((resolve, reject) => {
-      client.forwardOut('127.0.0.1', 0, host, port, (error, channel) => {
-        if (error) return reject(new Error(`Cannot forward to ${host}:${port}: ${error.message}`));
-        if (this.closed) { channel.destroy(); return; }
-        attempt.channels.push(channel);
-        channel.on('error', (error: Error) => this.fail(error, attempt));
-        channel.on('close', () => this.fail(new Error(`Forwarding to ${host}:${port} closed`), attempt));
-        resolve(channel);
-      });
-    });
-  }
-
   async open({ board, jumps = [] }: OpenOptions): Promise<{ host: string; port: number }> {
     const deadline = Date.now() + CONNECT_WARMUP_MS;
     for (; ;) {
       if (this.closed || this.failure) throw this.failure ?? new Error('Transport is closed');
-      const attempt: Attempt = { channels: [], clients: [], closures: [], live: false };
+      const attempt: Attempt = { peers: [], live: false };
       this.attempt = attempt;
       try {
         return await this.connect(attempt, { board, jumps });
       } catch (error) {
-        if (this.attempt === attempt) this.attempt = undefined;
         await this.teardown(attempt);
-        // A terminal failure (auth, bad config, close) must surface, not be retried.
+        if (this.attempt === attempt) this.attempt = undefined;
         if (!isTransientConnectError(error) || this.closed || this.failure) throw error;
-        // Enforce the warmup budget before spending another attempt, so the window
-        // bounds the total probe time instead of being extended by each retry.
         if (Date.now() + CONNECT_RETRY_MS >= deadline) throw error;
         await delay(CONNECT_RETRY_MS);
       }
@@ -111,73 +88,91 @@ export class Transport {
   }
 
   private async connect(attempt: Attempt, { board, jumps = [] }: OpenOptions): Promise<{ host: string; port: number }> {
-    let previous: Client | undefined;
-    for (const jump of jumps) {
-      const privateKey = jump.privateKeyFile ? await readFile(jump.privateKeyFile) : undefined;
-      const sock = previous ? await this.forward(attempt, previous, jump.host, jump.port ?? 22) : undefined;
-      if (this.closed) throw this.failure ?? new Error('Transport is closed');
-      const client = new Client();
-      attempt.clients.push(client);
-      let connectionClosed!: () => void;
-      attempt.closures.push(new Promise(resolve => {
-        connectionClosed = resolve;
-        client.once('close', resolve);
-      }));
-      client.on('error', error => this.fail(new Error(`Jump ${jump.host}: ${error.message}`), attempt));
-      client.on('close', () => this.fail(new Error(`Jump ${jump.host} closed`), attempt));
-      const config: ConnectConfig = {
-        host: jump.host, port: jump.port ?? 22, username: jump.username,
-        ...(privateKey ? { privateKey } : { password: jump.password }),
-        sock, readyTimeout: CONNECT_TIMEOUT, keepaliveInterval: 30_000, keepaliveCountMax: 3,
-      };
-      await this.wait<void>(resolve => {
-        client.once('ready', resolve);
-        try { client.connect(config); }
-        catch (error) {
-          // Invalid key/config can throw before ssh2 creates a socket. In that
-          // case destroy() has no socket and will never emit a close event.
-          client.destroy();
-          connectionClosed();
-          throw error;
-        }
+    let endpoint = { host: jumps[0]?.host ?? board.host, port: (jumps[0] ?? board).port ?? 22 };
+    for (let i = 0; i < jumps.length; i++) {
+      const jump = jumps[i];
+      const target = jumps[i + 1] ?? board;
+      const context = `Jump ${jump.host}:${jump.port ?? 22} forwarding to ${target.host}:${target.port ?? 22}`;
+      if (this.closed || attempt.error) throw attempt.error ?? new Error('Transport is closed');
+      const worker = new Worker(new URL('./native-worker.js', import.meta.url), {
+        workerData: { ...endpoint, username: jump.username,
+          auth: { type: 'password', password: jump.password }, terminal: false },
+        execArgv: [],
       });
-      previous = client;
+      const peer: Peer = { worker, stopped: new Promise(resolve => worker.once('exit', resolve)), writeId: 0 };
+      attempt.peers.push(peer);
+      worker.on('error', error => this.fail(new Error(`${context}: ${error.message}`), attempt));
+      worker.on('exit', () => this.fail(new Error(`${context}: SSH connection stopped`), attempt));
+      worker.on('message', message => {
+        if (this.closed || this.attempt !== attempt || attempt.error) return;
+        if (message.type === 'ready') peer.ready?.();
+        else if (message.type === 'forwarded') {
+          peer.channel = message.channel;
+          peer.forwarded?.();
+        } else if (message.type === 'data') {
+          if (message.channel === undefined) worker.postMessage({ type: 'consumed' });
+          else if (peer.socket) this.receive(peer, Buffer.from(message.data));
+          else peer.buffered = Buffer.from(message.data);
+        } else if (message.type === 'written') {
+          if (message.id === peer.writeId) peer.socket?.resume();
+        } else if (message.type === 'failure') this.fail(new Error(`${context}: ${message.message}`), attempt);
+        else if (message.type === 'channelClosed' && message.channel !== undefined)
+          this.fail(new Error(`${context}: forwarding channel closed`), attempt);
+      });
+      await this.wait<void>(resolve => { peer.ready = resolve; });
+      await this.wait<void>(resolve => {
+        peer.forwarded = resolve;
+        worker.postMessage({ type: 'openForward', id: 0, host: target.host, port: target.port ?? 22 });
+      });
+      endpoint = await this.bridge(attempt, peer);
     }
-    if (!previous) { attempt.live = true; return { host: board.host, port: board.port ?? 22 }; }
+    if (this.closed || attempt.error) throw attempt.error ?? new Error('Transport is closed');
+    attempt.live = true;
+    return endpoint;
+  }
 
-    const channel = await this.forward(attempt, previous, board.host, board.port ?? 22);
-    const server = attempt.server = createServer(socket => {
-      if (attempt.socket || this.closed) { socket.destroy(); return; }
-      attempt.socket = socket;
-      server.close(); // Stop listening; the accepted socket remains owned until close().
+  private receive(peer: Peer, data: Buffer): void {
+    peer.socket!.write(data, () => {
+      if (!this.closed && !peer.socket?.destroyed)
+        peer.worker.postMessage({ type: 'consumed', channel: peer.channel });
+    });
+  }
+
+  private async bridge(attempt: Attempt, peer: Peer): Promise<{ host: string; port: number }> {
+    const server = peer.server = createServer(socket => {
+      if (peer.socket || this.closed || this.attempt !== attempt || attempt.error) { socket.destroy(); return; }
+      peer.socket = socket;
+      server.close();
       socket.setNoDelay(true);
       socket.on('error', error => this.fail(error, attempt));
-      socket.on('close', () => this.fail(new Error('Board TCP bridge closed'), attempt));
-      socket.pipe(channel).pipe(socket);
+      socket.on('close', () => this.fail(new Error('SSH TCP bridge closed'), attempt));
+      socket.on('data', data => {
+        socket.pause();
+        peer.worker.postMessage({ type: 'write', id: ++peer.writeId, channel: peer.channel, data });
+      });
+      if (peer.buffered) {
+        this.receive(peer, peer.buffered);
+        peer.buffered = undefined;
+      }
     });
     server.on('error', error => this.fail(error, attempt));
     await this.wait<void>(resolve => server.listen(0, '127.0.0.1', resolve));
     const address = server.address();
-    if (!address || typeof address === 'string') throw new Error('Loopback bridge did not start');
-    attempt.live = true;
+    if (!address || typeof address === 'string') throw new Error('Cannot create SSH TCP bridge');
     return { host: '127.0.0.1', port: address.port };
   }
 
-  /** Release the resources of one attempt (used by retry and close). Idempotent. */
   private teardown(attempt: Attempt): Promise<void> {
-    attempt.teardown ??= (async () => {
-      attempt.socket?.destroy();
-      attempt.socket = undefined;
-      const closing: Promise<void>[] = [];
-      if (attempt.server?.listening) {
-        const server = attempt.server;
-        closing.push(new Promise(resolve => server.close(() => resolve())));
+    if (attempt.teardown) return attempt.teardown;
+    attempt.teardown = (async () => {
+      for (const peer of [...attempt.peers].reverse()) {
+        peer.socket?.destroy();
+        const listeningClosed = peer.server && new Promise<void>(resolve => peer.server!.close(() => resolve()));
+        const timer = setTimeout(() => { void peer.worker.terminate(); }, 1_000);
+        peer.worker.postMessage({ type: 'close' });
+        await Promise.all([peer.stopped, listeningClosed]);
+        clearTimeout(timer);
       }
-      attempt.server = undefined;
-      for (const channel of attempt.channels.reverse()) channel.destroy();
-      for (const client of attempt.clients.reverse()) client.destroy();
-      closing.push(...attempt.closures);
-      await Promise.all(closing);
     })();
     return attempt.teardown;
   }
