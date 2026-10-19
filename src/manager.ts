@@ -14,21 +14,18 @@ export interface ManagedBoard {
 	id: string;
 	name: string;
 	providerId: string;
-	lease: BoardLease | null;
 }
 
 export interface BoardManagerOptions {
 	idleMs?: number;
-	renewAheadMs?: number;
 }
 
 export interface BoardEvent extends ManagedBoard {
-	type: 'added' | 'renewed' | 'renewFailed' | 'released' | 'releaseFailed' | 'expired';
+	type: 'added' | 'released' | 'releaseFailed';
 	error?: Error;
 }
 
 export interface BoardState extends ManagedBoard {
-	remainingMs: number | null;
 	sessions: number;
 	available: boolean;
 	error?: Error;
@@ -36,6 +33,7 @@ export interface BoardState extends ManagedBoard {
 
 interface BoardEntry {
 	board: ManagedBoard;
+	lease: BoardLease | null;
 	provider: BoardProvider;
 	handle: unknown;
 	connection?: OpenOptions;
@@ -64,10 +62,8 @@ export class BoardManager {
 
 	constructor(options: BoardManagerOptions = {}) {
 		this.idleMs = options.idleMs ?? 600_000;
-		this.renewAheadMs = options.renewAheadMs ?? 600_000;
-		for (const value of [this.idleMs, this.renewAheadMs]) {
-			if (!Number.isFinite(value) || value <= 0) throw new RangeError('Lifecycle timing must be positive and finite');
-		}
+		this.renewAheadMs = 600_000;
+		if (!Number.isFinite(this.idleMs) || this.idleMs <= 0) throw new RangeError('Idle timeout must be positive and finite');
 		for (const provider of createProviders()) {
 			if (!provider.id || !provider.displayName || this.providers.has(provider.id)) {
 				throw new Error('Providers require a display name and a unique, non-empty ID');
@@ -141,8 +137,8 @@ export class BoardManager {
 
 	private newEntry(provider: BoardProvider, handle: unknown, key?: string): BoardEntry {
 		return {
-			board: { id: randomUUID(), name: provider.displayName, providerId: provider.id, lease: null },
-			provider, handle, key,
+			board: { id: randomUUID(), name: provider.displayName, providerId: provider.id },
+			lease: null, provider, handle, key,
 			sessions: new Set(), opening: new Set(), retiring: false, pending: Promise.resolve(),
 			lastActivityAt: Date.now(), activeOperations: 0, nextRenewAt: Infinity,
 		};
@@ -160,7 +156,7 @@ export class BoardManager {
 					throw new RangeError('Provider returned an invalid lease');
 				}
 				entry.board.name = result.name;
-				entry.board.lease = structuredClone(lease);
+				entry.lease = structuredClone(lease);
 				entry.connection = structuredClone(result.connection);
 				entry.nextRenewAt = lease === null ? Infinity : lease.expiresAt - this.renewAheadMs;
 			} catch (error) {
@@ -213,7 +209,7 @@ export class BoardManager {
 
 	private requireAvailable(entry: BoardEntry): void {
 		if (this.boards.get(entry.board.id) !== entry || entry.retiring || !entry.connection ||
-			(entry.board.lease !== null && entry.board.lease.expiresAt <= Date.now())) {
+			(entry.lease !== null && entry.lease.expiresAt <= Date.now())) {
 			throw new Error(`Managed board is not available: ${entry.board.name}`);
 		}
 	}
@@ -275,10 +271,10 @@ export class BoardManager {
 
 	/** Closes ALL sessions for this board, including handles held by other consumers. */
 	removeBoard(id: string): Promise<void> {
-		return this.finish(this.requireBoard(id), 'released');
+		return this.finish(this.requireBoard(id));
 	}
 
-	private finish(entry: BoardEntry, reason: 'released' | 'expired'): Promise<void> {
+	private finish(entry: BoardEntry): Promise<void> {
 		if (entry.terminal) return entry.terminal;
 		entry.retiring = true;
 		clearTimeout(entry.timer);
@@ -288,7 +284,7 @@ export class BoardManager {
 				await this.closeAll(entry);
 				await this.run(entry, async () => { await entry.provider.releaseBoard?.(entry.handle); });
 				this.boards.delete(entry.board.id);
-				this.notify(entry, reason);
+				this.notify(entry, 'released');
 			} catch (cause) {
 				entry.error = cause instanceof Error ? cause : new Error(String(cause));
 				this.notify(entry, 'releaseFailed', entry.error);
@@ -307,25 +303,14 @@ export class BoardManager {
 		const result = this.run(entry, async () => {
 			if (entry.retiring || this.isIdle(entry)) return;
 			this.requireAvailable(entry);
-			try {
-				const expiresAt = await entry.provider.renewBoard!(entry.handle);
-				if (!Number.isFinite(expiresAt) || expiresAt <= Math.max(Date.now(), entry.board.lease!.expiresAt)) {
-					throw new Error('Renewal must extend the expiration');
-				}
-				// Provider retains the remote result for cleanup even when this board is retiring.
-				this.requireAvailable(entry);
-				entry.board.lease = { expiresAt };
-				entry.error = undefined;
-				entry.nextRenewAt = expiresAt - Math.min(this.renewAheadMs, (expiresAt - Date.now()) / 2);
-				this.notify(entry, 'renewed');
-			} catch (cause) {
-				const error = cause instanceof Error ? cause : new Error(String(cause));
-				if (!entry.retiring) {
-					entry.error = error;
-					this.notify(entry, 'renewFailed', error);
-				}
-				throw error;
+			const expiresAt = await entry.provider.renewBoard!(entry.handle);
+			if (!Number.isFinite(expiresAt) || expiresAt <= Math.max(Date.now(), entry.lease!.expiresAt)) {
+				throw new Error('Renewal must extend the expiration');
 			}
+			// Provider retains the remote result for cleanup even when this board is retiring.
+			this.requireAvailable(entry);
+			entry.lease = { expiresAt };
+			entry.nextRenewAt = expiresAt - Math.min(this.renewAheadMs, (expiresAt - Date.now()) / 2);
 		});
 		entry.renewing = result;
 		void result.finally(() => { entry.renewing = undefined; this.schedule(entry); }).catch(() => { });
@@ -339,12 +324,12 @@ export class BoardManager {
 	private schedule(entry: BoardEntry): void {
 		clearTimeout(entry.timer);
 		if (entry.retiring || this.boards.get(entry.board.id) !== entry) return;
-		let deadline = entry.board.lease?.expiresAt ?? Infinity;
+		let deadline = entry.lease?.expiresAt ?? Infinity;
 		// Idle reclamation is a provider capability, independent of lease presence.
 		if (entry.provider.releaseBoard && !entry.activeOperations && !entry.opening.size) {
 			deadline = Math.min(deadline, entry.lastActivityAt + this.idleMs);
 		}
-		if (entry.board.lease !== null && entry.provider.renewBoard && !this.isIdle(entry)) {
+		if (entry.lease !== null && entry.provider.renewBoard && !this.isIdle(entry)) {
 			deadline = Math.min(deadline, entry.nextRenewAt);
 		}
 		if (deadline === Infinity) return;
@@ -354,11 +339,11 @@ export class BoardManager {
 
 	private evaluate(entry: BoardEntry): void {
 		if (entry.retiring || this.boards.get(entry.board.id) !== entry) return;
-		if (entry.board.lease !== null && entry.board.lease.expiresAt <= Date.now()) {
-			void this.finish(entry, 'expired').catch(() => { });
+		if (entry.lease !== null && entry.lease.expiresAt <= Date.now()) {
+			void this.finish(entry).catch(() => { });
 		} else if (entry.provider.releaseBoard && this.isIdle(entry)) {
-			void this.finish(entry, 'released').catch(() => { });
-		} else if (entry.board.lease !== null && entry.provider.renewBoard && !this.isIdle(entry) && entry.nextRenewAt <= Date.now()) {
+			void this.finish(entry).catch(() => { });
+		} else if (entry.lease !== null && entry.provider.renewBoard && !this.isIdle(entry) && entry.nextRenewAt <= Date.now()) {
 			void this.renew(entry).catch(() => { });
 		}
 		this.schedule(entry);
@@ -368,14 +353,14 @@ export class BoardManager {
 	listManagedBoards(providerId?: string): BoardState[] {
 		const now = Date.now();
 		const entries = [...this.boards.values()].filter(entry => providerId === undefined || entry.board.providerId === providerId);
-		return entries.map(({ board, sessions, retiring, error }) => {
+		return entries.map(({ board, lease, sessions, retiring, error }) => {
 			for (const session of sessions) {
 				if (session.isClosed) sessions.delete(session);
 			}
 			return {
-				...structuredClone(board), remainingMs: board.lease === null ? null : board.lease.expiresAt - now,
+				...structuredClone(board),
 				sessions: sessions.size,
-				available: !retiring && (board.lease === null || board.lease.expiresAt > now),
+				available: !retiring && (lease === null || lease.expiresAt > now),
 				...(error ? { error } : {}),
 			};
 		});

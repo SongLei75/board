@@ -229,7 +229,7 @@ await manager.removeBoard(batonBoard.id); // 关闭所有 SSH，然后释放预�
 | `login(providerId, input?)` | 透明转交给 Provider 的可选登录方法；无登录方法时直接成功，未知来源抛错。 |
 | `listAvailableBoards(providerId)` | 独立查询来源真实候选，不接受凭据或触发登录；无查询方法或当前无候选均返回 `[]`，未知来源、认证或查询错误正常抛出。 |
 | `addBoard(providerId, input)` | 由 Provider 校验业务输入和获取资源，返回 `ManagedBoard`，不校验 SSH 参数或建立 SSH。 |
-| `listManagedBoards(providerId?)` | 直接从 Manager 的资源 Map 返回已管理板子及剩余租期、未关闭会话数、可用状态和可选错误；可按来源筛选，不需要轮询来驱动生命周期。 |
+| `listManagedBoards(providerId?)` | 直接从 Manager 的资源 Map 返回已管理板子、未关闭会话数、可用状态和可选错误；可按来源筛选，不需要轮询来驱动生命周期。 |
 | `getBoard(id)` | 查找一块已管理板子的基本信息，不存在时返回 `undefined`。 |
 | `openBoard(boardId)` | 每次新建独立 SSH 和持久 shell，返回 `BoardSession`。 |
 | `removeBoard(boardId)` | 关闭该板全部 SSH，按可用能力释放资源，成功后移除记录。 |
@@ -238,8 +238,8 @@ await manager.removeBoard(batonBoard.id); // 关闭所有 SSH，然后释放预�
 
 **`removeBoard(boardId)` 会关闭该板子的全部 SSH Session，包括其他消费端仍持有的句柄。** 消费者无需逐个关闭 Session。Manager 不提供 `closeSession()` 或 `dispose()`；底层 `session.close()` 仍可用于关闭单条 SSH，不释放板子、不影响其他会话。
 
-- `ManagedBoard` 为 `{ id, name, providerId, lease }`，`lease` 是 `null` 或 `{ expiresAt }`。Manager 生成管理 ID，返回值不含 SSH 凭据或 Provider 私有句柄。
-- `listManagedBoards(providerId?)` 每项在基本信息上增加 `remainingMs/sessions/available/error?`。返回的数据为快照，修改它不会改变管理记录。
+- `ManagedBoard` 为 `{ id, name, providerId }`。Manager 生成管理 ID，返回值不含 SSH 凭据或 Provider 私有句柄。
+- `listManagedBoards(providerId?)` 每项在基本信息上增加 `sessions/available/error?`。返回的数据为快照，修改它不会改变管理记录。
 - 同板增加 SSH 使用 `openBoard(boardId)`。Baton 通过内部稳定资源键合并在途添加、复用已有登记，避免重复预约；Static 每次添加独立登记。
 - 添加失败由 Provider 补偿；成功返回后登记失败由 Manager 按可用释放能力补偿。补偿失败保留不可用记录，通过 `listManagedBoards()` 找到 ID 后重试 `removeBoard(id)`。
 
@@ -275,14 +275,14 @@ Manager 不维护唯一“当前板”，不保存 Chat/Agent ID。同板 Sessio
 
 ### 自动续约与到期
 
-默认 `renewAheadMs = 600_000`（十分钟），可调整。只有 Provider 有 `renewBoard` 且资源有有效租约、尚未空闲时，Manager 才在临近到期时调用续约。续约时长由 Provider 决定，消费者不用维护定时器。
+Manager 内部默认在到期前十分钟尝试续约。只有 Provider 有 `renewBoard` 且资源有有效租约、尚未空闲时，Manager 才在临近到期时调用续约。续约时长由 Provider 决定，消费者不用维护定时器。
 
 - 空闲回收优先于续约；续约不刷新 SSH 活动时间。
 - 同板续约与释放串行，在途续约合并，不同板互不阻塞。
 - 新租期必须延长现有租期且尚未到期。短租期按剩余时间的一半再次检查，避免连续立即续约。
-- 续约失败报告 `renewFailed`，同租期不无限自动重试；到期后立即阻止连接、关闭 SSH。
+- 续约失败由 Manager 内部处理，同租期不无限自动重试；到期后立即阻止连接、关闭 SSH。
 - 到期/释放先关本地 SSH，再等待在途续约结束并调用可用的 `releaseBoard`。迟到续约不能复活本地资源。Baton 仅在确认自然过期时跳过网络 release；续约超时或响应无效时仍按现有策略尝试释放。
 
-`onDidChange()` 通知 `added/renewed/renewFailed/released/releaseFailed/expired`，事件包含板子基本信息、类型与可选错误。监听器异常不影响清理。每板最多一个 `unref()` 定时器，不阻止 Node 退出；仅管理当前进程和 Manager 实例，不引入跨进程恢复、连接池或自动重连。
+`onDidChange()` 通知 `added/released/releaseFailed`，到期回收同样通知 `released`，事件包含板子基本信息、类型与可选错误，不暴露租期或续约结果。监听器异常不影响清理。每板最多一个 `unref()` 定时器，不阻止 Node 退出；仅管理当前进程和 Manager 实例，不引入跨进程恢复、连接池或自动重连。
 
 全链路 SSH 和转发均使用 wolfSSH；普通 SSH 私钥认证、SCP/SFTP 尚未实现。
