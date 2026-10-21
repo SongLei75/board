@@ -3,6 +3,7 @@ import { parentPort, workerData } from 'node:worker_threads';
 
 interface Native {
   create(config: unknown): unknown;
+  scpStep(handle: unknown, upload: boolean, local: string, remote: string): boolean;
   handshake(handle: unknown): boolean;
   poll(handle: unknown, receive: boolean): boolean;
   openForward(handle: unknown, host: string, port: number): number;
@@ -39,6 +40,14 @@ function stop(error?: unknown): void {
 function pump(): void {
   if (stopped) return;
   try {
+    if (workerData.scp) {
+      const { upload, local, remote } = workerData.scp;
+      if (native.scpStep(handle, upload, local, remote)) {
+        port.postMessage({ type: 'complete' });
+        stop();
+      }
+      return;
+    }
     if (!ready) {
       if (!native.handshake(handle)) return;
       ready = true;

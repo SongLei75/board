@@ -14,14 +14,14 @@
 | --- | --- |
 | `src/identity.ts` | 默认读取包内 debug.key；可校验并原子替换用户数据目录中的共用 PEM，目录 `0700`、文件 `0600`。 |
 | `src/transport.ts` | 通过通用 Worker 迭代建立密码跳板连接，维护每跳 loopback 桥接、背压、重试及反向资源清理。 |
-| `src/session.ts` | 公开 API、在 `BoardSession.open()` 中统一校验 SSH 参数、shell 就绪、命令完成标记、输出消费、超时及关闭状态，向 Manager 提供轻量活动通知。 |
-| `src/native-worker.ts` | 唯一的通用 Worker 脚本；每实例调度独立 addon 连接的握手、Shell/Forward 通道 I/O 和消费确认，不区分板端或跳板。 |
+| `src/session.ts` | 公开 API、在 `BoardSession.open()` 中统一校验 SSH 参数、shell 就绪、命令完成标记、输出消费、独立 SCP 传输的创建/超时/取消清理及关闭状态，向 Manager 提供轻量活动通知。 |
+| `src/native-worker.ts` | 唯一的通用 Worker 脚本；每实例调度独立 addon 连接的握手、Shell/Forward 通道 I/O、SCP 非阻塞步骤和消费确认，不区分板端或跳板。 |
 | `src/provider.ts` | 包内 Provider 回调契约与工厂注册、消费者共享数据类型与内部添加补偿错误；可选 `listAvailableBoards` 查询来源真实候选。 |
 | `src/index.ts` | 加载内置 Provider 模块以完成自注册，并导出消费者 API。 |
 | `src/static.ts` | StaticProvider；仅校验可选显示名称并保存直连或多跳参数，无登录、候选查询、租约或释放能力。 |
 | `src/baton.ts` | 内部 Baton HTTP Client 与 Provider：`login` 验证并优先复用有效 Token、`listAvailableBoards` 独立查询真实可预约板、按板子 ID 预约与连接解析、最小单位续约和释放，无生命周期计时器。 |
 | `src/manager.ts` | 包内初始化 Provider 注册表、按 ID 统一添加/移除、`listManagedBoards(providerId?)` 从自身资源 Map 返回已管理记录并可按来源筛选、自动租期管理、每板多条独立 SSH、按可选能力空闲回收及自动续期，不定义 Chat 当前板。 |
-| `native/addon.cc` | 调用 wolfSSH/wolfSSL 动态库，拥有通用 socket、Password/X.509 认证材料、Shell/Forward 通道及有上限的加密发送缓冲。 |
+| `native/addon.cc` | 调用 wolfSSH/wolfSSL 动态库，拥有通用 socket、Password/X.509 认证材料、Shell/Forward 通道、独立 SCP 状态驱动、文件回调、目录遍历及有上限的加密发送缓冲；不修改进程 cwd。 |
 
 通用 SSH 参数仅在 `BoardSession.open()` 校验；Provider 只校验自身业务输入，Manager 只校验资源名称和租期。无效 SSH 配置可能先登记或预约，直到 `openBoard()` 才报错。Provider 不维护已管理列表。
 
@@ -101,3 +101,13 @@ make publish tag=carizon               # 指定 dist-tag
 - 目标版本已存在时，先按 npm 单版本 unpublish 路径摘除该版本并删除其 tarball 再重推；其余版本与 dist-tag 不受影响。
 - `prebuilds/`（含 addon、wolfSSH/wolfSSL 动态库、win32 的 MinGW 运行时 DLL 与调试凭据 `debug.key`）纳入 git 跟踪，使预构建产物可复现；`build/`（本地 wolfSSH/wolfSSL 安装树与 `build/deps/`）与 `dist/`（由 `src/` 打包时生成）不入库。
 - 本包只携带构建平台的预构建 addon 与动态库，消费者 `npm install` 时不编译原生代码。
+
+## SCP 构建与验收
+
+`upload(localPath, remotePath)` / `download(remotePath, localPath)` 自动支持文件及递归目录。每次另建 Transport 与同一个 `native-worker.ts` 的独立实例，不在持久 Shell 上运行 SCP，也不改变 Transport 的一对一转发结构。Manager/Provider 无须增加传输业务逻辑。
+
+wolfSSH 必须启用 `--enable-scp`，并包含本次 `/home/songlei/project/wolf/wolfssh` 的必要修改：公开 `wolfSSH_SetScpRecursive` 和 `wolfSSH_GetScpErrorMsg`，远端路径引用，按边界消费控制消息与确认，非阻塞重试，以及自定义回调不进入默认文件上下文的清理/重命名逻辑。Linux 仍需 `--enable-term` 和 `NO_TERMIOS`。更新 wolfSSH 后同步两平台 `build/deps/` 头文件、动态库与 Windows import library，再运行 `make build`；不需要重编 wolfSSL。board 构建仍只消费依赖，不构建 wolfSSH。
+
+不使用远端 find 预扫描。允许跟随源符号链接；上传检测祖先循环，两方向限制深度 128、总时长 5 分钟。下载拒绝不安全条目名、越界目录层级及目标树中的符号链接。错误可能留下部分目标，不能报告成功；具体路径语义和限制见 README。
+
+真实功能验收应覆盖 0/1/多跳、文件和目录双向 SHA-256、空目录/隐藏文件/零字节/Unicode、覆盖和冲突、链接循环、并发、取消和文件描述符稳定性，以及传输前后的持久 Shell。Windows Wine 运行结果必须与原生 Windows 主机验收区分。不得提交临时身份、账号、SSH 配置或测试数据。

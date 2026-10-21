@@ -17,7 +17,7 @@ find_library(WOLFSSH_LIBRARY NAMES wolfssh PATHS "${WOLFSSH_ROOT}/lib" NO_DEFAUL
 find_library(WOLFSSL_LIBRARY NAMES wolfssl PATHS "${WOLFSSL_ROOT}/lib" NO_DEFAULT_PATH NO_CACHE REQUIRED)
 add_library(board_session MODULE addon.cc)
 target_compile_features(board_session PRIVATE cxx_std_17)
-target_compile_definitions(board_session PRIVATE NAPI_VERSION=8 WOLFSSH_CERTS WOLFSSH_TERM)
+target_compile_definitions(board_session PRIVATE NAPI_VERSION=8 WOLFSSH_CERTS WOLFSSH_TERM WOLFSSH_SCP)
 target_compile_options(board_session PRIVATE -Wall -Wextra -Werror)
 target_include_directories(board_session PRIVATE "${NODE_INCLUDE_DIR}" "${WOLFSSH_INCLUDE}" "${WOLFSSL_INCLUDE}")
 target_link_libraries(board_session PRIVATE "${WOLFSSH_LIBRARY}" "${WOLFSSL_LIBRARY}")

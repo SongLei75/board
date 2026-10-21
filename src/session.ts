@@ -1,3 +1,4 @@
+import { resolve as resolvePath } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import { Worker } from 'node:worker_threads';
@@ -57,12 +58,19 @@ export class BoardSession {
   private writes = new Map<number, { resolve: () => void; reject: (error: Error) => void }>();
   private openingReject?: (error: Error) => void;
 
+  private options?: OpenOptions;
+  private identity?: Buffer;
+  private readonly transfers = new Set<{ cancel: (error: Error) => void; done: Promise<void> }>();
+
   private constructor() {}
 
   static async open(options: OpenOptions): Promise<BoardSession> {
     validate(options);
+    options = { board: { ...options.board }, jumps: options.jumps?.map(jump => ({ ...jump })) };
     const pem = await readIdentity();
     const session = new BoardSession();
+    session.options = options;
+    session.identity = Buffer.from(pem);
     try {
       const endpoint = await session.transport.open(options);
       if (session.closed) throw session.failure ?? new Error('Transport closed during open');
@@ -231,10 +239,88 @@ export class BoardSession {
     }
   }
 
+  upload(localPath: string, remotePath: string, signal?: AbortSignal): Promise<void> {
+    return this.transfer(true, localPath, remotePath, signal);
+  }
+
+  download(remotePath: string, localPath: string, signal?: AbortSignal): Promise<void> {
+    return this.transfer(false, localPath, remotePath, signal);
+  }
+
+  private transfer(upload: boolean, localPath: string, remotePath: string, signal?: AbortSignal): Promise<void> {
+    this.ensureOpen();
+    for (const path of [localPath, remotePath]) {
+      if (typeof path !== 'string' || !path || /[\0\r\n]/.test(path))
+        throw new TypeError('SCP paths must be nonempty strings without NUL, CR or LF');
+    }
+    if (Buffer.byteLength(remotePath) > 1024) throw new RangeError('SCP remote path is too long');
+    const local = resolvePath(localPath);
+    const options = this.options!;
+    let worker: Worker | undefined;
+    let stopped: Promise<void> | undefined;
+    let starting: Promise<void> | undefined;
+    let settled = false;
+    let finish!: (error?: Error) => void;
+    const transport = new Transport(error => finish(error));
+    const task = { cancel: (error: Error) => finish(error), done: Promise.resolve() };
+    this[sessionActivity]?.('start');
+    task.done = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => finish(new Error('SCP transfer timed out after 5 minutes')), 300_000);
+      finish = error => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        void (async () => {
+          let kill: ReturnType<typeof setTimeout> | undefined;
+          if (worker && worker.threadId !== -1) {
+            kill = setTimeout(() => { void worker!.terminate(); }, 1_000);
+            worker.postMessage({ type: 'close' });
+          }
+          try {
+            await Promise.all([stopped, transport.close(), starting]);
+            if (error) reject(new Error(`SCP ${upload ? 'upload' : 'download'} failed: ${error.message}. ` +
+              'The destination may contain partial files or directories.', { cause: error }));
+            else resolve();
+          } catch (cleanupError) { reject(cleanupError); }
+          finally { clearTimeout(kill); }
+        })();
+      };
+      starting = (async () => {
+        const endpoint = await transport.open(options);
+        if (settled) return;
+        worker = new Worker(new URL('./native-worker.js', import.meta.url), {
+          workerData: { ...endpoint, username: options.board.username,
+            auth: { type: 'x509', identity: this.identity }, terminal: false,
+            scp: { upload, local, remote: remotePath } },
+          execArgv: [],
+        });
+        stopped = new Promise<void>(resolve => worker!.once('exit', () => resolve()));
+        worker.on('message', message => {
+          if (message.type === 'complete') finish();
+          else if (message.type === 'failure') finish(new Error(message.message));
+        });
+        worker.on('error', finish);
+        worker.on('exit', () => finish(new Error('SCP worker stopped before completion')));
+      })().catch(finish);
+    }).finally(() => {
+      this.transfers.delete(task);
+      this[sessionActivity]?.('end');
+    });
+    this.transfers.add(task);
+    const onAbort = () => task.cancel(new Error('SCP transfer cancelled'));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    return task.done.finally(() => signal?.removeEventListener('abort', onAbort));
+  }
+
   close(): Promise<void> {
     if (this.closing) return this.closing;
     this.closed = true;
+    this.options = undefined;
+    this.identity?.fill(0);
+    this.identity = undefined;
     const error = this.failure ?? new Error('BoardSession is closed');
+    for (const transfer of this.transfers) transfer.cancel(error);
     this.openingReject?.(error);
     this.openingReject = undefined;
     if (this.command) {
@@ -253,7 +339,8 @@ export class BoardSession {
         worker.once('exit', () => { clearTimeout(timer); resolve(); });
         worker.postMessage({ type: 'close' });
       }) : Promise.resolve();
-      await Promise.all([stopped, this.transport.close()]);
+      await Promise.all([stopped, this.transport.close(),
+        ...[...this.transfers].map(transfer => transfer.done.catch(() => {}))]);
     })();
     return this.closing;
   }
